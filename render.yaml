@@ -1,0 +1,14 @@
+# Optional Blueprint — paste in Render or put at Git repo root (some setups expect root).
+# Create a Background Worker; set Root Directory to "deploy" if needed.
+
+services:
+  - type: worker
+    name: liveportrait-telegram-bot
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
