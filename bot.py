@@ -55,7 +55,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SPACE_ID = "KlingTeam/LivePortrait"
+SPACE_ID = "innoai/LivePortrait"
 API_ANIMATE = "/gpu_wrapped_execute_video"
 
 MAX_VIDEO_BYTES = 48 * 1024 * 1024
