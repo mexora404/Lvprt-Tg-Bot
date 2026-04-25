@@ -55,8 +55,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SPACE_ID = "innoai/LivePortrait"
-API_ANIMATE = "/gpu_wrapped_execute_video"
+# Override: HF_SPACE_ID=owner/space-name  HF_API_NAME=/route (full URL nahi — sirf user/repo)
+SPACE_ID = (os.environ.get("HF_SPACE_ID") or "innoai/LivePortrait").strip()
+API_ANIMATE = (os.environ.get("HF_API_NAME") or "/gpu_wrapped_execute_video").strip()
 
 MAX_VIDEO_BYTES = 48 * 1024 * 1024
 # Telegram full-size photos can be huge / slow; timeout + prefer 2nd-largest size
@@ -71,9 +72,15 @@ try:
 except ValueError:
     TELEGRAM_READ_TIMEOUT_SEC = 300
 
-# White 9:16 export: canvas size + inner box (40% of W and 40% of H max) for centered clip
-FIT916_W = 1080
-FIT916_H = 1920
+# White 9:16 export: lower res = smaller file + better device playback. Override: FIT916_W, FIT916_H
+try:
+    _fw = int(os.environ.get("FIT916_W", "720"))
+    _fh = int(os.environ.get("FIT916_H", "1280"))
+except ValueError:
+    _fw, _fh = 720, 1280
+_fw = max(256, min(_fw, 1080)) - (max(256, min(_fw, 1080)) % 2)
+_fh = max(256, min(_fh, 1920)) - (max(256, min(_fh, 1920)) % 2)
+FIT916_W, FIT916_H = _fw, _fh
 FIT916_BOX_FRAC = 0.40
 FIT916_SOURCE_KEY = "fit916_source"
 CALLBACK_FIT916 = "out:fit916"
@@ -510,18 +517,35 @@ async def output_format_callback(update: Update, context: ContextTypes.DEFAULT_T
         await q.answer("Clip missing — run a new render first.", show_alert=True)
         return
     await q.answer()
+    p_h264: str | None = None
     fd1, tmp_silent = tempfile.mkstemp(suffix=".mp4", prefix="fit916_s_")
     os.close(fd1)
     fd2, tmp_final = tempfile.mkstemp(suffix=".mp4", prefix="fit916_f_")
     os.close(fd2)
     try:
         await asyncio.to_thread(render_white_916_center_40pct, src, tmp_silent)
-        path_to_send = tmp_silent
-        if _try_mux_audio_into(tmp_silent, src, tmp_final):
+        vpath = tmp_silent
+        fd3, p_h264 = tempfile.mkstemp(suffix=".mp4", prefix="fit916_h264_")
+        os.close(fd3)
+        if await asyncio.to_thread(_try_reencode_h264_for_playback, tmp_silent, p_h264):
             try:
                 os.unlink(tmp_silent)
             except OSError:
                 pass
+            vpath = p_h264
+        else:
+            try:
+                os.unlink(p_h264)
+            except OSError:
+                pass
+            p_h264 = None
+        path_to_send = vpath
+        if _try_mux_audio_into(vpath, src, tmp_final):
+            if vpath != tmp_final:
+                try:
+                    os.unlink(vpath)
+                except OSError:
+                    pass
             path_to_send = tmp_final
         else:
             try:
@@ -537,14 +561,14 @@ async def output_format_callback(update: Update, context: ContextTypes.DEFAULT_T
                 f"📦 9:16 export too large for Telegram (~{sz // (1024 * 1024)} MB)."
             )
             return
-        cap = "✨ 9:16 white · 40% center"
+        cap = f"✨ 9:16 white · 40% center · {FIT916_W}×{FIT916_H}"
         with open(path_to_send, "rb") as vf:
             await _reply_video_resilient(q.message, vf, caption=cap)
     except Exception as e:
         logger.exception("9:16 export failed")
         await q.message.reply_text(f"9:16 export failed: {e!s}")
     finally:
-        for p in (tmp_silent, tmp_final):
+        for p in (tmp_silent, p_h264, tmp_final):
             if p and os.path.isfile(p):
                 try:
                     os.unlink(p)
@@ -1091,6 +1115,45 @@ def _try_mux_audio_into(composite_silent: str, audio_src: str, dst_path: str) ->
         return False
 
 
+def _try_reencode_h264_for_playback(src_path: str, dst_path: str) -> bool:
+    """Re-encode OpenCV mp4v output to H.264 yuv420p + faststart — plays on more phones/TVs."""
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        if os.path.isfile(dst_path):
+            os.unlink(dst_path)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src_path,
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-an",
+                dst_path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=600,
+        )
+        return os.path.isfile(dst_path) and os.path.getsize(dst_path) > 32
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        logger.exception("H.264 re-encode for 9:16 (install ffmpeg for best compatibility)")
+        try:
+            if os.path.isfile(dst_path):
+                os.unlink(dst_path)
+        except OSError:
+            pass
+        return False
+
+
 def _pick_photo_file_id(message) -> str:
     """Prefer 2nd-largest size — still sharp for faces, much faster than max resolution."""
     photos = message.photo
@@ -1561,6 +1624,44 @@ async def post_init(app: Application) -> None:
     )
 
 
+def _maybe_bind_render_web_port() -> None:
+    """If PORT is set (e.g. Render/Railway Web Service), listen so health checks pass.
+
+    Long-polling bots do not need HTTP; prefer **Background Worker** on Render (no PORT).
+    Without a listener, the platform may restart the container and uploads can fail mid-flight.
+    """
+    raw = (os.environ.get("PORT") or "").strip()
+    if not raw:
+        return
+    try:
+        port = int(raw)
+    except ValueError:
+        return
+    if not (1 <= port <= 65535):
+        return
+
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Health(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    def _serve() -> None:
+        HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+    threading.Thread(target=_serve, daemon=True, name="health-http").start()
+    logger.info(
+        "Health HTTP on 0.0.0.0:%s (PORT set). Prefer Render Background Worker — no port needed.",
+        port,
+    )
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1620,7 +1721,9 @@ def main() -> None:
     # MP4 as file often lacks video/* mime; route non-image documents and detect in handler
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE, on_video_document))
 
+    _maybe_bind_render_web_port()
     logger.info("Bot starting (long polling)…")
+    logger.info("Hugging Face Space: %s  api_name=%s", SPACE_ID, API_ANIMATE)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
