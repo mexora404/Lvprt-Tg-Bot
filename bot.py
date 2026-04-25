@@ -72,14 +72,17 @@ try:
 except ValueError:
     TELEGRAM_READ_TIMEOUT_SEC = 300
 
-# White 9:16 export: lower res = smaller file + better device playback. Override: FIT916_W, FIT916_H
+# Many platforms: MPEG-4 max width ≤ 1920, height ≤ 1088 (e.g. vertical 1080×1920 fails).
+MPEG4_MAX_W = 1920
+MPEG4_MAX_H = 1088
+# White 9:16: default 612×1088 = 9:16 and within limits. Override FIT916_W / FIT916_H (clamped)
 try:
-    _fw = int(os.environ.get("FIT916_W", "720"))
-    _fh = int(os.environ.get("FIT916_H", "1280"))
+    _fw = int(os.environ.get("FIT916_W", "612"))
+    _fh = int(os.environ.get("FIT916_H", "1088"))
 except ValueError:
-    _fw, _fh = 720, 1280
-_fw = max(256, min(_fw, 1080)) - (max(256, min(_fw, 1080)) % 2)
-_fh = max(256, min(_fh, 1920)) - (max(256, min(_fh, 1920)) % 2)
+    _fw, _fh = 612, 1088
+_fw = max(2, min(_fw, MPEG4_MAX_W)) - (max(2, min(_fw, MPEG4_MAX_W)) % 2)
+_fh = max(2, min(_fh, MPEG4_MAX_H)) - (max(2, min(_fh, MPEG4_MAX_H)) % 2)
 FIT916_W, FIT916_H = _fw, _fh
 FIT916_BOX_FRAC = 0.40
 FIT916_SOURCE_KEY = "fit916_source"
@@ -1154,6 +1157,80 @@ def _try_reencode_h264_for_playback(src_path: str, dst_path: str) -> bool:
         return False
 
 
+def _video_dims_cv2(path: str) -> tuple[int, int] | None:
+    cap = cv2.VideoCapture(path)
+    try:
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if w > 0 and h > 0:
+            return w, h
+    finally:
+        cap.release()
+    return None
+
+
+def _ensure_mpeg4_limit_path(src: str) -> str | None:
+    """If frame size exceeds MPEG4_MAX_W×MPEG4_MAX_H, return temp file scaled + H.264; else None."""
+    dims = _video_dims_cv2(src)
+    if dims and dims[0] <= MPEG4_MAX_W and dims[1] <= MPEG4_MAX_H:
+        return None
+    if dims:
+        logger.info(
+            "Main output %s×%s → scaling to max %s×%s (MPEG-4 / platform limit)",
+            dims[0],
+            dims[1],
+            MPEG4_MAX_W,
+            MPEG4_MAX_H,
+        )
+    if not shutil.which("ffmpeg"):
+        if dims and (dims[0] > MPEG4_MAX_W or dims[1] > MPEG4_MAX_H):
+            logger.warning(
+                "Output exceeds %s×%s; set ffmpeg in PATH to auto-reencode for Telegram/upload limits",
+                MPEG4_MAX_W,
+                MPEG4_MAX_H,
+            )
+        return None
+    fd, out = tempfile.mkstemp(suffix=".mp4", prefix="main_lim_")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src,
+                "-vf",
+                f"scale={MPEG4_MAX_W}:{MPEG4_MAX_H}:force_original_aspect_ratio=decrease",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                out,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=1800,
+        )
+        if os.path.isfile(out) and os.path.getsize(out) > 32:
+            return out
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        logger.exception("MPEG-4 limit re-encode for main output")
+    try:
+        if os.path.isfile(out):
+            os.unlink(out)
+    except OSError:
+        pass
+    return None
+
+
 def _pick_photo_file_id(message) -> str:
     """Prefer 2nd-largest size — still sharp for faces, much faster than max resolution."""
     photos = message.photo
@@ -1564,6 +1641,7 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for caption, vp in paths:
         if not vp:
             continue
+        lim_path: str | None = None
         try:
             if vp.startswith("http"):
                 await update.effective_message.reply_html(f"<b>{escape(caption)}</b>\n<code>{vp}</code>")
@@ -1571,13 +1649,23 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not os.path.isfile(vp):
                 await update.effective_message.reply_text(f"{caption}: file not found on disk.")
                 continue
-            size = os.path.getsize(vp)
+            lim_path = await asyncio.to_thread(_ensure_mpeg4_limit_path, vp)
+            send_p = lim_path or vp
+            if not os.path.isfile(send_p):
+                await update.effective_message.reply_text(f"{caption}: file not found on disk.")
+                continue
+            size = os.path.getsize(send_p)
             if size > MAX_VIDEO_BYTES:
+                if lim_path and os.path.isfile(lim_path):
+                    try:
+                        os.unlink(lim_path)
+                    except OSError:
+                        pass
                 await update.effective_message.reply_html(
                     f"<b>{escape(caption)}</b>\nOutput too large for Telegram (~{size // (1024 * 1024)} MB)."
                 )
                 continue
-            with open(vp, "rb") as f:
+            with open(send_p, "rb") as f:
                 await _reply_video_resilient(
                     update.effective_message,
                     f,
@@ -1608,6 +1696,12 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.exception("Send video failed")
             await update.effective_message.reply_text(f"{caption}: could not send ({e!s}).")
+        finally:
+            if lim_path and os.path.isfile(lim_path):
+                try:
+                    os.unlink(lim_path)
+                except OSError:
+                    pass
 
 
 async def post_init(app: Application) -> None:
