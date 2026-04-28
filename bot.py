@@ -56,7 +56,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Override: HF_SPACE_ID=owner/space-name  HF_API_NAME=/route (full URL nahi — sirf user/repo)
-SPACE_ID = (os.environ.get("HF_SPACE_ID") or "innoai/LivePortrait").strip()
+SPACE_ID = (os.environ.get("HF_SPACE_ID") or "SahaniJi/LivePortrait").strip()
 API_ANIMATE = (os.environ.get("HF_API_NAME") or "/gpu_wrapped_execute_video").strip()
 
 MAX_VIDEO_BYTES = 48 * 1024 * 1024
