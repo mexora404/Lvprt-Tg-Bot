@@ -75,7 +75,7 @@ except ValueError:
 # Many platforms: MPEG-4 max width ≤ 1920, height ≤ 1088 (e.g. vertical 1080×1920 fails).
 MPEG4_MAX_W = 1920
 MPEG4_MAX_H = 1088
-# White 9:16: default 612×1088 = 9:16 and within limits. Override FIT916_W / FIT916_H (clamped)
+# 9:16 canvas: 612×1088 = exact 9:16 within MPEG-4 limit
 try:
     _fw = int(os.environ.get("FIT916_W", "612"))
     _fh = int(os.environ.get("FIT916_H", "1088"))
@@ -84,9 +84,26 @@ except ValueError:
 _fw = max(2, min(_fw, MPEG4_MAX_W)) - (max(2, min(_fw, MPEG4_MAX_W)) % 2)
 _fh = max(2, min(_fh, MPEG4_MAX_H)) - (max(2, min(_fh, MPEG4_MAX_H)) % 2)
 FIT916_W, FIT916_H = _fw, _fh
-FIT916_BOX_FRAC = 0.40
+
+# 9:16 composite: background image file (admin-set; defaults to bundled room image)
+_DATA_DIR = Path(__file__).resolve().parent / "data"
+FIT916_BG_FILE = _DATA_DIR / "fit916_bg.jpg"
+FIT916_BG_DEFAULT = _DATA_DIR / "fit916_bg.jpg"  # bundled default (same path)
+
+# Scale / position controls for 9:16 export
+FIT916_DEFAULT_SCALE = 90   # % of canvas width (and height) to fit clip into
+FIT916_SCALE_STEP = 10      # each +/- button adjusts by this %
+FIT916_YOFF_STEP = 10       # shift up/down by this % of canvas height
+FIT916_MIN_SCALE = 30
+FIT916_MAX_SCALE = 100
+FIT916_MIN_YOFF = -40       # negative = up
+FIT916_MAX_YOFF = 40        # positive = down
+
 FIT916_SOURCE_KEY = "fit916_source"
-CALLBACK_FIT916 = "out:fit916"
+PENDING_BG_KEY = "pending_fit916_bg"
+# Callback format: "out:f916:{scale_pct}:{y_off_pct}"  e.g. "out:f916:90:0"
+CALLBACK_FIT916_PFX = "out:f916:"
+CALLBACK_FIT916 = f"{CALLBACK_FIT916_PFX}{FIT916_DEFAULT_SCALE}:0"
 
 WAIT_ADMIN_PW = 0
 
@@ -162,6 +179,7 @@ def inline_keyboard_denied() -> InlineKeyboardMarkup:
 
 def inline_keyboard_admin_quick() -> InlineKeyboardMarkup:
     """Tap-only admin actions (works alongside reply keyboard; separate message)."""
+    bg_label = "🖼 BG set ✅" if has_fit916_bg() else "🖼 Set 9:16 BG"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🎬 Set default video", callback_data="admin:setdefault")],
@@ -170,6 +188,10 @@ def inline_keyboard_admin_quick() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📋 Users", callback_data="admin:listusers"),
             ],
             [InlineKeyboardButton("🗑 Clear default", callback_data="admin:cleardef")],
+            [
+                InlineKeyboardButton(bg_label, callback_data="admin:setbg"),
+                InlineKeyboardButton("🗑 Clear BG", callback_data="admin:clearbg"),
+            ],
         ]
     )
 
@@ -244,7 +266,7 @@ def get_hf_token() -> str | None:
 def get_gradio_client() -> Client:
     global _hf_client
     if _hf_client is None:
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"httpx_kwargs": {"timeout": 1800}}  # 30 min for ZeroGPU queue
         t = get_hf_token()
         if t:
             kwargs["token"] = t
@@ -359,6 +381,19 @@ def clear_media_session(ud: dict[str, Any]) -> None:
     ud.pop("video_path", None)
     ud.pop("busy", None)
     ud.pop(PENDING_DEFAULT_DV_KEY, None)
+    ud.pop(PENDING_BG_KEY, None)
+
+
+def has_fit916_bg() -> bool:
+    return FIT916_BG_FILE.is_file() and FIT916_BG_FILE.stat().st_size > 0
+
+
+def clear_fit916_bg() -> None:
+    if FIT916_BG_FILE.is_file():
+        try:
+            FIT916_BG_FILE.unlink()
+        except OSError:
+            pass
 
 
 def _html_whoami(cid: int) -> str:
@@ -504,29 +539,57 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await q.message.reply_html(_html_help())
 
 
-async def output_format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inline: generate white 9:16 + 40% centered clip from last raw output."""
-    q = update.callback_query
-    if not q or (q.data or "") != CALLBACK_FIT916:
-        return
-    if not q.message:
-        await q.answer("No message context.", show_alert=True)
-        return
-    if not can_use_features(context, q.message.chat_id):
-        await q.answer("🔒 Not allowed.", show_alert=True)
-        return
-    src = context.user_data.get(FIT916_SOURCE_KEY)
-    if not src or not os.path.isfile(src):
-        await q.answer("Clip missing — run a new render first.", show_alert=True)
-        return
-    await q.answer()
+def _parse_fit916_callback(data: str) -> tuple[int, int] | None:
+    """Parse 'out:f916:{scale}:{yoff}' → (scale_pct, y_off_pct) or None."""
+    if not data.startswith(CALLBACK_FIT916_PFX):
+        return None
+    rest = data[len(CALLBACK_FIT916_PFX):]
+    parts = rest.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _fit916_markup(scale: int, y_off: int) -> InlineKeyboardMarkup:
+    """Adjustment buttons: bigger/smaller + up/down + current params label."""
+    def cb(s: int, y: int) -> str:
+        return f"{CALLBACK_FIT916_PFX}{s}:{y}"
+
+    bigger_s = min(scale + FIT916_SCALE_STEP, FIT916_MAX_SCALE)
+    smaller_s = max(scale - FIT916_SCALE_STEP, FIT916_MIN_SCALE)
+    up_y = max(y_off - FIT916_YOFF_STEP, FIT916_MIN_YOFF)
+    dn_y = min(y_off + FIT916_YOFF_STEP, FIT916_MAX_YOFF)
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(f"📤 Bada (+{FIT916_SCALE_STEP}%)", callback_data=cb(bigger_s, y_off)),
+            InlineKeyboardButton(f"📥 Chota (-{FIT916_SCALE_STEP}%)", callback_data=cb(smaller_s, y_off)),
+        ],
+        [
+            InlineKeyboardButton("⬆️ Upar", callback_data=cb(scale, up_y)),
+            InlineKeyboardButton("⬇️ Neeche", callback_data=cb(scale, dn_y)),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _do_fit916_export(
+    src: str,
+    scale_pct: int,
+    y_off_pct: int,
+    reply_to,
+) -> None:
+    """Render + send 9:16 composite; reply_to is the message to reply to."""
     p_h264: str | None = None
     fd1, tmp_silent = tempfile.mkstemp(suffix=".mp4", prefix="fit916_s_")
     os.close(fd1)
     fd2, tmp_final = tempfile.mkstemp(suffix=".mp4", prefix="fit916_f_")
     os.close(fd2)
     try:
-        await asyncio.to_thread(render_white_916_center_40pct, src, tmp_silent)
+        await asyncio.to_thread(render_916_composite, src, tmp_silent, scale_pct, y_off_pct)
         vpath = tmp_silent
         fd3, p_h264 = tempfile.mkstemp(suffix=".mp4", prefix="fit916_h264_")
         os.close(fd3)
@@ -556,20 +619,23 @@ async def output_format_callback(update: Update, context: ContextTypes.DEFAULT_T
             except OSError:
                 pass
         if not os.path.isfile(path_to_send) or os.path.getsize(path_to_send) < 32:
-            await q.message.reply_text("9:16 export produced an empty file.")
+            await reply_to.reply_text("9:16 export — empty file.")
             return
         sz = os.path.getsize(path_to_send)
         if sz > MAX_VIDEO_BYTES:
-            await q.message.reply_html(
+            await reply_to.reply_html(
                 f"📦 9:16 export too large for Telegram (~{sz // (1024 * 1024)} MB)."
             )
             return
-        cap = f"✨ 9:16 white · 40% center · {FIT916_W}×{FIT916_H}"
+        y_sign = ("+" if y_off_pct > 0 else "") + (str(y_off_pct) if y_off_pct != 0 else "")
+        caption = f"📱 9:16 · {scale_pct}% · {FIT916_W}×{FIT916_H}" + (f" · y{y_sign}%" if y_off_pct != 0 else "")
         with open(path_to_send, "rb") as vf:
-            await _reply_video_resilient(q.message, vf, caption=cap)
-    except Exception as e:
-        logger.exception("9:16 export failed")
-        await q.message.reply_text(f"9:16 export failed: {e!s}")
+            await _reply_video_resilient(reply_to, vf, caption=caption)
+        await reply_to.reply_html(
+            f"🎛 <b>Scale:</b> {scale_pct}%  |  <b>Y offset:</b> {y_sign or '0'}%\n"
+            "<i>Bada/chota ya upar/neeche adjust karo:</i>",
+            reply_markup=_fit916_markup(scale_pct, y_off_pct),
+        )
     finally:
         for p in (tmp_silent, p_h264, tmp_final):
             if p and os.path.isfile(p):
@@ -577,6 +643,36 @@ async def output_format_callback(update: Update, context: ContextTypes.DEFAULT_T
                     os.unlink(p)
                 except OSError:
                     pass
+
+
+async def output_format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline: generate 9:16 bg composite with scale/y_offset from callback data."""
+    q = update.callback_query
+    data = q.data or "" if q else ""
+    if not data.startswith(CALLBACK_FIT916_PFX):
+        return
+    if not q or not q.message:
+        return
+    parsed = _parse_fit916_callback(data)
+    if parsed is None:
+        await q.answer("Invalid params.", show_alert=True)
+        return
+    scale_pct, y_off_pct = parsed
+    scale_pct = max(FIT916_MIN_SCALE, min(scale_pct, FIT916_MAX_SCALE))
+    y_off_pct = max(FIT916_MIN_YOFF, min(y_off_pct, FIT916_MAX_YOFF))
+    if not can_use_features(context, q.message.chat_id):
+        await q.answer("🔒 Not allowed.", show_alert=True)
+        return
+    src = context.user_data.get(FIT916_SOURCE_KEY)
+    if not src or not os.path.isfile(src):
+        await q.answer("Clip missing — run a new render first.", show_alert=True)
+        return
+    await q.answer()
+    try:
+        await _do_fit916_export(src, scale_pct, y_off_pct, q.message)
+    except Exception as e:
+        logger.exception("9:16 export failed")
+        await q.message.reply_text(f"9:16 export failed: {e!s}")
 
 
 async def send_admin_quick_inline(after_message, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -656,6 +752,29 @@ async def admin_quick_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         dv.clear_files()
         await q.message.reply_text(
             "🗑 Default driving video removed.",
+            reply_markup=reply_keyboard_for_context(context),
+        )
+        return
+    if data == "admin:setbg":
+        context.user_data[PENDING_BG_KEY] = True
+        cancel_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Cancel", callback_data="admin:cancel_setbg")]]
+        )
+        await q.message.reply_html(
+            "🖼 <b>9:16 Background Image</b>\n\n"
+            "👉 Ab <b>agle message</b> mein ek <b>photo</b> bhejo — woh 9:16 frame ka background ban jayega.\n"
+            "<i>Cancel:</i> neeche button.",
+            reply_markup=cancel_kb,
+        )
+        return
+    if data == "admin:cancel_setbg":
+        context.user_data.pop(PENDING_BG_KEY, None)
+        await q.message.reply_html("🚫 BG upload cancelled.", reply_markup=reply_keyboard_for_context(context))
+        return
+    if data == "admin:clearbg":
+        clear_fit916_bg()
+        await q.message.reply_html(
+            "🗑 9:16 background image removed — white bg use hoga.",
             reply_markup=reply_keyboard_for_context(context),
         )
 
@@ -1033,8 +1152,28 @@ def pick_main_output_video_path(result: Any) -> str | None:
     return p0
 
 
-def render_white_916_center_40pct(src_path: str, dst_path: str) -> None:
-    """Composite source video on white 9:16 canvas; content scaled to fit inside 40%×40% box, centered."""
+def _load_bg_frame(W: int, H: int) -> np.ndarray:
+    """Load bg image resized to W×H; fallback to white if missing/invalid."""
+    bg_path = str(FIT916_BG_FILE)
+    if FIT916_BG_FILE.is_file():
+        try:
+            img = cv2.imread(bg_path)
+            if img is not None and img.size > 0:
+                if img.shape[1] != W or img.shape[0] != H:
+                    img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LANCZOS4)
+                return img.astype(np.uint8)
+        except Exception:
+            pass
+    return np.full((H, W, 3), 255, dtype=np.uint8)
+
+
+def render_916_composite(
+    src_path: str,
+    dst_path: str,
+    scale_pct: int = 90,
+    y_off_pct: int = 0,
+) -> None:
+    """Composite video on 9:16 bg. Clip fits inside scale_pct% box, y_off_pct shifts up/down."""
     cap = cv2.VideoCapture(src_path)
     if not cap.isOpened():
         raise ValueError("cannot open source video")
@@ -1044,8 +1183,11 @@ def render_white_916_center_40pct(src_path: str, dst_path: str) -> None:
         if fps < 1 or fps > 120:
             fps = 25.0
         W, H = FIT916_W, FIT916_H
-        max_w = max(2, int(W * FIT916_BOX_FRAC))
-        max_h = max(2, int(H * FIT916_BOX_FRAC))
+        frac = max(0.1, min(scale_pct / 100.0, 1.0))
+        max_w = max(2, int(W * frac)) - (max(2, int(W * frac)) % 2)
+        max_h = max(2, int(H * frac)) - (max(2, int(H * frac)) % 2)
+        y_off_px = int(H * y_off_pct / 100.0)
+        bg_template = _load_bg_frame(W, H)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(dst_path, fourcc, fps, (W, H))
         if not out.isOpened():
@@ -1057,19 +1199,26 @@ def render_white_916_center_40pct(src_path: str, dst_path: str) -> None:
             fh, fw = frame.shape[:2]
             if fw < 1 or fh < 1:
                 continue
-            scale = min(max_w / fw, max_h / fh)
-            nw = max(1, int(round(fw * scale)))
-            nh = max(1, int(round(fh * scale)))
-            small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-            canvas = np.full((H, W, 3), 255, dtype=np.uint8)
+            sc = min(max_w / fw, max_h / fh)
+            nw = max(2, int(round(fw * sc))) - (max(2, int(round(fw * sc))) % 2)
+            nh = max(2, int(round(fh * sc))) - (max(2, int(round(fh * sc))) % 2)
+            interp = cv2.INTER_LANCZOS4 if sc > 1 else cv2.INTER_AREA
+            small = cv2.resize(frame, (nw, nh), interpolation=interp)
+            canvas = bg_template.copy()
             x0 = (W - nw) // 2
-            y0 = (H - nh) // 2
+            y0 = (H - nh) // 2 + y_off_px
+            y0 = max(0, min(y0, H - nh))
             canvas[y0 : y0 + nh, x0 : x0 + nw] = small
             out.write(canvas)
     finally:
         if out is not None:
             out.release()
         cap.release()
+
+
+def render_white_916_center_40pct(src_path: str, dst_path: str) -> None:
+    """Legacy alias — calls render_916_composite with default 90% scale."""
+    render_916_composite(src_path, dst_path, scale_pct=FIT916_DEFAULT_SCALE, y_off_pct=0)
 
 
 def _try_mux_audio_into(composite_silent: str, audio_src: str, dst_path: str) -> bool:
@@ -1362,6 +1511,37 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not can_use_features(context, update.effective_chat.id):
         await deny_access_message(update, context)
         return
+
+    # --- Admin: save 9:16 background image ---
+    if context.user_data.get(PENDING_BG_KEY) and context.user_data.get("admin_ok"):
+        context.user_data.pop(PENDING_BG_KEY, None)
+        ack = await update.message.reply_html("🖼 <b>BG photo received</b>\n⏳ <i>Saving…</i>")
+        try:
+            photos = update.message.photo
+            file_id = photos[-1].file_id
+            tg_file = await context.bot.get_file(file_id)
+            _DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = str(FIT916_BG_FILE) + ".tmp"
+            await tg_file.download_to_drive(custom_path=tmp_path)
+            img = cv2.imread(tmp_path)
+            if img is None:
+                raise ValueError("Could not decode image")
+            cv2.imwrite(str(FIT916_BG_FILE), img, [cv2.IMWRITE_JPEG_QUALITY, 93])
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            await _edit_msg_html(
+                ack,
+                "✅ <b>9:16 BG saved!</b>\n"
+                f"📐 {img.shape[1]}×{img.shape[0]} → will be resized to {FIT916_W}×{FIT916_H} on export.",
+                reply_markup=reply_keyboard_for_context(context),
+            )
+        except Exception as e:
+            logger.exception("Save fit916 BG failed")
+            await _edit_msg_html(ack, f"❌ BG save failed: {e!s}", reply_markup=reply_keyboard_for_context(context))
+        return
+
     if context.user_data.get("busy"):
         await update.message.reply_text("⏳ Already processing…\nUse /start to reset.")
         return
@@ -1679,9 +1859,10 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 logger.exception("stash raw output for 9:16")
             else:
+                bg_label = "🖼 bg set" if has_fit916_bg() else "⬜ white bg"
                 await update.effective_message.reply_html(
-                    "📐 <b>Optional:</b> white <b>9:16</b> background — clip <b>40%</b> centered.\n"
-                    "<i>Tap the button below for that version.</i>",
+                    f"📐 <b>Optional:</b> 9:16 frame ({bg_label}) — clip <b>{FIT916_DEFAULT_SCALE}%</b> centered.\n"
+                    "<i>Tap to generate; then adjust size / position.</i>",
                     reply_markup=InlineKeyboardMarkup(
                         [
                             [
